@@ -19,6 +19,7 @@ from metadata.generated.schema.api.data.createDashboardDataModel import (
     CreateDashboardDataModelRequest,
 )
 from metadata.generated.schema.entity.data.chart import Chart
+from metadata.generated.schema.entity.data.dashboard import Dashboard
 from metadata.generated.schema.entity.data.dashboardDataModel import (
     DashboardDataModel,
     DataModelType,
@@ -121,6 +122,24 @@ class SigmaSource(DashboardServiceSource):
             return
 
         try:
+            # Build dataModels FQNs from context (if present). The context items can be either
+            # raw identifiers (elementId) or objects with an `elementId` attribute.
+            data_models_fqns = []
+            for dm in (self.context.get().dataModels or []):
+                dm_id = getattr(dm, "elementId", None) or getattr(dm, "id", None) or dm
+                try:
+                    dm_fqn = fqn.build(
+                        self.metadata,
+                        entity_type=DashboardDataModel,
+                        service_name=self.context.get().dashboard_service,
+                        data_model_name=dm_id,
+                    )
+                    data_models_fqns.append(FullyQualifiedEntityName(dm_fqn))
+                except Exception:
+                    logger.debug(
+                        f"Could not build FQN for data model [{dm_id}] while creating dashboard {dashboard_details.name}"
+                    )
+
             dashboard_request = CreateDashboardRequest(
                 name=EntityName(str(dashboard_details.workbookId)),
                 displayName=dashboard_details.name,
@@ -136,6 +155,7 @@ class SigmaSource(DashboardServiceSource):
                     )
                     for chart in self.context.get().charts or []
                 ],
+                dataModels=data_models_fqns or None,
                 service=FullyQualifiedEntityName(self.context.get().dashboard_service),
                 sourceUrl=SourceUrl(dashboard_details.url),
                 owners=self.get_owner_ref(dashboard_details=dashboard_details),
@@ -358,8 +378,28 @@ class SigmaSource(DashboardServiceSource):
 
         queries_by_element = {q.elementId: q for q in queries_response.entries}
 
+        # Try to resolve the dashboard entity once so we can also emit DataModel -> Dashboard lineage
+        dashboard_entity = None
+        try:
+            dashboard_fqn = fqn.build(
+                self.metadata,
+                entity_type=Dashboard,
+                service_name=self.context.get().dashboard_service,
+                dashboard_name=dashboard_details.workbookId,
+            )
+            if dashboard_fqn:
+                dashboard_entity = self.metadata.get_by_name(entity=Dashboard, fqn=dashboard_fqn)
+        except Exception:
+            logger.debug(f"Could not resolve dashboard entity for lineage: {dashboard_details.workbookId}")
+
         for data_model in self.data_models or []:
             try:
+                # Skip elements without a visualization type to avoid emitting lineage for text/divider elements
+                if not getattr(data_model, "vizualizationType", None):
+                    dm_id = getattr(data_model, "elementId", None) or getattr(data_model, "id", None) or data_model
+                    logger.debug(f"Skipping DataModel element [{dm_id}] in lineage due to missing vizualizationType")
+                    continue
+
                 data_model_entity = self._get_datamodel(datamodel_id=data_model.elementId)
                 if not data_model_entity:
                     continue
@@ -370,6 +410,9 @@ class SigmaSource(DashboardServiceSource):
                     yield from self._yield_lineage_from_files_for_element(
                         dashboard_details, data_model, db_service_prefix
                     )
+                    # After file-based lineage, if we resolved the dashboard entity, emit DataModel -> Dashboard edge
+                    if dashboard_entity:
+                        yield self._get_add_lineage_request(to_entity=dashboard_entity, from_entity=data_model_entity)
                     continue
 
                 lineage_parser = LineageParser(
@@ -402,10 +445,14 @@ class SigmaSource(DashboardServiceSource):
                     )
 
                     if table_entity:
+                        # table -> dataModel
                         yield self._get_add_lineage_request(
                             to_entity=data_model_entity,
                             from_entity=table_entity,
                         )
+                        # dataModel -> dashboard (if we resolved it)
+                        if dashboard_entity:
+                            yield self._get_add_lineage_request(to_entity=dashboard_entity, from_entity=data_model_entity)
 
             except Exception as exc:
                 yield Either(
@@ -448,6 +495,12 @@ class SigmaSource(DashboardServiceSource):
             self.data_models = self.client.get_chart_details(dashboard_details.workbookId)
             for data_model in self.data_models or []:
                 try:
+                    # Skip elements without a visualization type (they are often text boxes or dividers)
+                    if not getattr(data_model, "vizualizationType", None):
+                        dm_id = getattr(data_model, "elementId", None) or getattr(data_model, "id", None) or data_model
+                        logger.debug(f"Skipping DataModel element [{dm_id}] due to missing vizualizationType")
+                        continue
+
                     data_model_request = CreateDashboardDataModelRequest(
                         name=EntityName(data_model.elementId),
                         displayName=data_model.name or f"Element {data_model.elementId}",

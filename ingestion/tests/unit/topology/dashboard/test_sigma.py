@@ -156,6 +156,7 @@ EXPECTED_DASHBOARD = [
         description="SAMPLE DESCRIPTION",
         sourceUrl="http://url.com/to/dashboard",
         charts=[],
+        dataModels=[FullyQualifiedEntityName("mock_sigma.elem1")],
         service=FullyQualifiedEntityName("mock_sigma"),
     )
 ]
@@ -261,6 +262,8 @@ class SigmaUnitTest(TestCase):
         """
         Function for testing charts
         """
+        # Provide dataModels in context so the dashboard will include dataModels FQNs
+        self.sigma.context.get().__dict__["dataModels"] = [Elements(elementId="elem1", name="test_element", vizualizationType="table")]
         results = list(self.sigma.yield_dashboard(MOCK_DASHBOARD_DETAILS))
         self.assertEqual(EXPECTED_DASHBOARD, [res.right for res in results])
 
